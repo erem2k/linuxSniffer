@@ -314,13 +314,13 @@ static bool readStats()
 	}
 	else
 	{            
-        fgets(buf, 256, fp); //Gets device_count string
+                fgets(buf, 256, fp); //Gets device_count string
 		buf[strcspn(buf, "\n")] = 0;
-		strtok(buf, "=");
+                strtok(buf, "=");
 		devices = atoi(strtok(NULL, "="));
 		
-		if (devices <= 0)
-			return false;
+                if (devices <= 0)
+                    return false;
                 
 		deviceStats = (struct deviceStat_t*) malloc(sizeof(struct deviceStat_t) * devices);
 		
