@@ -7,7 +7,7 @@
 #include <arpa/inet.h>
 
 
-#define MSG_INCORRECT_COMMAND "Unrecognized syntax. Use CLIENTNAME --h to list available commands"
+#define MSG_INCORRECT_COMMAND "Unrecognized syntax. Use sniffer_client --h to list available commands\n"
 
 //char *socket_path = "./socket";
 char *socket_path = "\0hidden";
