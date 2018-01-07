@@ -16,12 +16,25 @@
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <pcap.h>
+#include <pthread.h>
+#include <ds.h>
 
-//char *socket_path = "./socket";
-char *socket_path = "\0hidden";
 const char *statsFile = "./snifferStats.dat";
 struct deviceStat_t *deviceStats = NULL;
 int deviceCount = 0, selDeviceIndex = 0;
+
+int initPipe[2];
+
+bool sniffingFlag = false;
+bool shutdownFlag = false;
+
+pthread_t handleRequestsThread;
+
+pthread_mutex_t mu_deviceStats = PTHREAD_MUTEX_INITIALIZER;
+//Covers usage of selDeviceIndex, deviceCount and deviceStats itself, since they are always used together
+pthread_mutex_t mu_isSniffing = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mu_isShutdown = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mu_statsFile = PTHREAD_MUTEX_INITIALIZER;
 
 /*Data structures*/
 struct ipStat_t {
@@ -31,9 +44,10 @@ struct ipStat_t {
 
 struct deviceStat_t {
 	char deviceName[16];
-	struct ipStat_t * ipStats;
+        AVLTREE ipTree;
 	int ipCount;
 };
+
 
 /*Utility functions*/
 bool writeWrap(int fd, const char* data, size_t dataSize)
@@ -50,81 +64,45 @@ bool writeWrap(int fd, const char* data, size_t dataSize)
 	return 1;
 }
 
-void setSocketBlockingEnabled(int fd, bool blocking)
+bool isSniffing()
 {
-   /*Disabled blocking disables main loop from blocking at accept() waiting for signal from socket
-     This allows sniffer loop to run */
-   if (fd < 0) 
-	   return;
-   int flags = fcntl(fd, F_GETFL, 0);
-   if (flags < 0) 
-	   return;
-   flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-   fcntl(fd, F_SETFL, flags);
+	bool status;
+	
+	pthread_mutex_lock(&mu_isSniffing);
+	status = sniffingFlag;
+	pthread_mutex_unlock(&mu_isSniffing);
+	
+	return status;
 }
 
-static void merge(struct ipStat_t *arr, int low, int mid, int high)
+bool isShutdown()
 {
-    int mergedSize = high - low + 1;
-    struct ipStat_t *temp = (struct ipStat_t *)malloc(mergedSize * sizeof(struct ipStat_t));
-    int mergePos = 0;
-    int leftPos = low;
-    int rightPos = mid + 1;
-
-    while (leftPos <= mid && rightPos <= high)     
-    {
-        if (arr[leftPos].ip < arr[rightPos].ip)
-            temp[mergePos++] = arr[leftPos++];
-        else
-            temp[mergePos++] = arr[rightPos++];
-    }
-
-    while (leftPos <= mid)
-        temp[mergePos++] = arr[leftPos++];
-
-    while (rightPos <= high)
-        temp[mergePos++] = arr[rightPos++];
-
-    for (mergePos = 0; mergePos < mergedSize; ++mergePos)
-        arr[low + mergePos] = temp[mergePos];
-
-    free(temp);
+	bool status;
+	
+	pthread_mutex_lock(&mu_isShutdown);
+	status = shutdownFlag;
+	pthread_mutex_unlock(&mu_isShutdown);
+	
+	return status;
 }
 
-static void msort_ip(struct ipStat_t *arr, int low, int high)
+int cmp_ipStat(DSKEY a, DSKEY b)
 {
-    if (low < high)
-    {
-        int mid = (low + high) / 2;
+        return (a < b)? -1 : (a > b) ? 1 : 0 ;
+}		
 
-        msort_ip(arr, low, mid);
-        msort_ip(arr, mid + 1, high);
-
-        merge(arr, low, mid, high);
-    }
+void freeNodeData(void* entry_data)
+{
+    free(entry_data);
 }
 
-int bsearch_ip(in_addr_t  ip)
-{
-	int floor = 0, ceiling = deviceStats[selDeviceIndex].ipCount;
-	while (floor <= ceiling) {
-		int median = (floor + (ceiling - floor) / 2);
-		if (deviceStats[selDeviceIndex].ipStats[median].ip == ip) {
-			return median;
-		}
-                if (deviceStats[selDeviceIndex].ipStats[median].ip < ip)
-                        floor = median + 1;
-                else
-                        ceiling = median - 1;
-	}
-	return -1;
-}
-
-/*Server-client communication functions*/
-
+/*Client-server query functions*/
 void sendStatsOnIface(int fd, int index)
 {
 	char *returnString;
+	
+	pthread_mutex_lock(&mu_deviceStats);	
+	
 	if (index == -1) {
 		int totalIps = 0;
 		for (int i = 0; i < deviceCount; i++)
@@ -137,17 +115,17 @@ void sendStatsOnIface(int fd, int index)
 				strcpy(returnString, deviceStats[i].deviceName);
 			else
 				strcat(returnString, deviceStats[i].deviceName);
-                        strcat(returnString, ":\n");
-                        for (int j = 0; j < deviceStats[i].ipCount; j++) {
-                                char snum[16];
-                                struct in_addr src;
-                                src.s_addr = deviceStats[i].ipStats[j].ip;
-                                strcat(returnString, inet_ntoa(src));
-                                strcat(returnString, " : Packets received ");
-                                sprintf(snum, "%d", deviceStats[i].ipStats[j].packetCount);
-                                strcat(returnString, snum);
-                                strcat(returnString, "\n");
-                        }
+			strcat(returnString, ":\n");
+			for (struct ipStat_t* entry = (struct ipStat_t*) avlFirst(deviceStats[i].ipTree); entry; entry = (struct ipStat_t*) avlNext(deviceStats[i].ipTree)) {
+				char snum[16];
+				struct in_addr src;
+				src.s_addr = entry->ip;
+				strcat(returnString, inet_ntoa(src));
+				strcat(returnString, " : Packets received ");
+				sprintf(snum, "%d", entry->packetCount);
+				strcat(returnString, snum);
+				strcat(returnString, "\n");	
+			}
 		}
 	}
 	else if (index < deviceCount) {
@@ -158,19 +136,23 @@ void sendStatsOnIface(int fd, int index)
 		strcpy(returnString, deviceStats[index].deviceName);
 
 		strcat(returnString, ":\n");
-		for (int j = 0; j < deviceStats[index].ipCount; j++) {
-			char snum[8];
-			strcat(returnString, inet_ntoa((struct in_addr){deviceStats[index].ipStats[j].ip}));
-			strcat(returnString, " : Packets received ");
-                        sprintf(snum, "%d", deviceStats[index].ipStats[j].packetCount);
-			strcat(returnString, snum);
-			strcat(returnString, "\n");
-		}		
+		for (struct ipStat_t* entry = (struct ipStat_t*) avlFirst(deviceStats[index].ipTree); entry; entry = (struct ipStat_t*) avlNext(deviceStats[index].ipTree)) {
+			 char snum[16];
+			 struct in_addr src;
+			 src.s_addr = entry->ip;
+			 strcat(returnString, inet_ntoa(src));
+			 strcat(returnString, " : Packets received ");
+			 sprintf(snum, "%d", entry->packetCount);
+			 strcat(returnString, snum);
+			 strcat(returnString, "\n");	
+		 }                		
 	}
 	else {
 		returnString = (char*) malloc(sizeof("Interface not found!\n"));
 		returnString = "Interface not found!\n";
 	}
+	
+	pthread_mutex_unlock(&mu_deviceStats);
 		
 	if (!writeWrap(fd, returnString, strlen(returnString) + 1))
 		syslog (LOG_WARNING, "Server: Partial write to socket");
@@ -194,26 +176,42 @@ void sendIpStats(char * ip, int fd)
 			syslog (LOG_WARNING, "Server: Partial write to socket");		
 		return;
 	}
-	index = bsearch_ip(requestedIp.s_addr);
 	
-	if (index != -1) {
+	struct ipStat_t* foundNode = (struct ipStat_t*) avlFind(deviceStats[selDeviceIndex].ipTree, (DSKEY) requestedIp.s_addr);
+	
+	if (foundNode) {
 		char *returnString = (char*) malloc((23 + strlen(ip) + 8) * sizeof(char)); //Text + IP + Packet count
-		sprintf (returnString, "IP:%s\nPackets Received:%d\n", ip, deviceStats[selDeviceIndex].ipStats[index].packetCount);
+		
+		pthread_mutex_lock(&mu_deviceStats);
+		sprintf (returnString, "IP:%s\nPackets Received:%d\n", ip, foundNode->packetCount);
+		
+		pthread_mutex_unlock(&mu_deviceStats);
+		
 		if (!writeWrap(fd, returnString, strlen(returnString)))
 			syslog (LOG_WARNING, "Server: Partial write to socket");
 		free (returnString);
 	}
 	else
 		if (!writeWrap(fd, "Requested IP wasn't found\n", sizeof("Requested IP wasn't found\n")))
-			syslog (LOG_WARNING, "Server: Partial write to socket");	
+			syslog (LOG_WARNING, "Server: Partial write to socket");
+	
 }
 
 /*Daemon-related functions*/
 static void daemonShutdown()
 {
+	//End sniffer thread
+	pthread_mutex_lock(&mu_isShutdown);
+	shutdownFlag = true;
+	pthread_mutex_unlock(&mu_isShutdown);
+	
+	pthread_join(handleRequestsThread, NULL);
+	
+	pthread_mutex_lock(&mu_deviceStats);
 	for (int i = 0; i < deviceCount; i++)
-		free(deviceStats[i].ipStats);
+		avlCloseWithFunction(deviceStats[i].ipTree, freeNodeData);
 	free(deviceStats);
+	pthread_mutex_unlock(&mu_deviceStats);
 	
 	closelog();
 }
@@ -244,7 +242,6 @@ static void daemonize()
     /* Fork off the parent process */
     pid = fork();
 
-    /* An error occurred */
     if (pid < 0)
         exit(EXIT_FAILURE);
 
@@ -286,16 +283,19 @@ static void daemonize()
         close (x);
     }
 
-    openlog ("task_sniffer", LOG_PID, LOG_DAEMON);
+    openlog ("sniffer_daemon", LOG_PID, LOG_DAEMON);
 }
 
 /*File I/O*/
 static bool readStats()
 {
+	pthread_mutex_lock(&mu_statsFile);
 	//Heavily relies on file structure being correct
 	FILE* fp = fopen(statsFile, "r");
 	char buf[256];
 	int devices = 0, ips = 0, devicesRead = 0;
+	
+	pthread_mutex_unlock(&mu_statsFile);	
 	
 	syslog (LOG_NOTICE, "Server: Attempting to read statistics from file");
 	
@@ -313,15 +313,18 @@ static bool readStats()
 		return false;		
 	}
 	else
-	{            
-                fgets(buf, 256, fp); //Gets device_count string
+	{            				
+		fgets(buf, 256, fp); //Gets device_count string
 		buf[strcspn(buf, "\n")] = 0;
-                strtok(buf, "=");
+		strtok(buf, "=");
 		devices = atoi(strtok(NULL, "="));
 		
-                if (devices <= 0)
-                    return false;
-                
+		if (devices <= 0)
+			return false;
+        
+		//Lock once actual operations on shared memory are executed
+		pthread_mutex_lock(&mu_deviceStats);
+		
 		deviceStats = (struct deviceStat_t*) malloc(sizeof(struct deviceStat_t) * devices);
 		
 		for (int i = 0; i < devices; i++) {
@@ -333,9 +336,6 @@ static bool readStats()
 			strcpy(deviceStats[i].deviceName, tokP);
 			tokP = strtok(NULL, " :");
 			deviceStats[i].ipCount = atoi(tokP);
-			
-			deviceStats[i].ipStats = (struct ipStat_t*) malloc(sizeof(struct ipStat_t) * (deviceStats[i].ipCount / 100 + 1) * 100);
-			//100-element pages to avoid reallocating each time new ip is found
 		}
 		
 		fgets(buf, 256, fp);
@@ -349,29 +349,36 @@ static bool readStats()
 	
 	while (fgets(buf, 256, fp) != NULL) {	//Processes each device's IPs
 		buf[strcspn(buf, "\n")] = 0;
+		deviceStats[devicesRead].ipTree = avlNewTree(cmp_ipStat, 0, sizeof(in_addr_t));
 		
 		for (int i = 0; i < deviceStats[devicesRead].ipCount; i++) {
 			char *tokP;
+			struct ipStat_t* ipEntry = calloc(1, sizeof(struct ipStat_t));
 			fgets(buf, 256, fp);
 			buf[strcspn(buf, "\n")] = 0;
 			tokP = strtok(buf, " :");
-			sscanf(tokP, "%"SCNu32, &(deviceStats[devicesRead].ipStats[i].ip));
+			sscanf(tokP, "%"SCNu32, &ipEntry->ip);
 			tokP = strtok(NULL, " :");
-			deviceStats[devicesRead].ipStats[i].packetCount = atoi(tokP);
+			ipEntry->packetCount = atoi(tokP);
+			avlAdd(deviceStats[devicesRead].ipTree, ipEntry->ip, (void*) ipEntry);
 		}
 
 		devicesRead++;
 	}
 	syslog (LOG_NOTICE, "Server: Statistics file read complete");
 	fclose(fp);
+	pthread_mutex_unlock(&mu_deviceStats);
 	return true;
 }
 
 static bool writeStats()
 {
+	pthread_mutex_lock(&mu_statsFile);
 	FILE* fp = fopen(statsFile, "w+");
 	char buf[256], currentInterface[16];
 	int devices = 0, ips = 0, devicesRead = 0;
+	
+	pthread_mutex_unlock(&mu_statsFile);
 	
 	syslog (LOG_NOTICE, "Server: Attempting to write statistics to file");
 	
@@ -380,32 +387,205 @@ static bool writeStats()
 		return false;
 	}
 	
+	pthread_mutex_lock(&mu_deviceStats);
 	fprintf(fp, "#stat_head_begin\n");
 	fprintf(fp, "#device_count=%d\n", deviceCount);
 	for (int i = 0; i < deviceCount; i++)
-		fprintf(fp, " %s:%d\n", deviceStats[i].deviceName, deviceStats[i].ipCount);
+	fprintf(fp, " %s:%d\n", deviceStats[i].deviceName, deviceStats[i].ipCount);
 	fprintf(fp, "#stat_head_end\n");
 	
 	for (int i = 0; i < deviceCount; i++) {
 		fprintf(fp, "%s\n", deviceStats[i].deviceName);
-		for (int j = 0; j < deviceStats[i].ipCount; j++)
-			fprintf(fp, " %" PRIu32 ":%d\n", deviceStats[i].ipStats[j].ip, deviceStats[i].ipStats[j].packetCount);
+		for (struct ipStat_t* entry = (struct ipStat_t*) avlFirst(deviceStats[i].ipTree); entry; entry = (struct ipStat_t*) avlNext(deviceStats[i].ipTree))
+			fprintf(fp, " %" PRIu32 ":%d\n", entry->ip, entry->packetCount);
 	}
-        fflush(fp);
-        fclose(fp);
+	pthread_mutex_unlock(&mu_deviceStats);
+	fflush(fp);
+	fclose(fp);
 	syslog (LOG_NOTICE, "Server: Written statistics data to file");
 }
 
-int main() {
-	struct sockaddr_un addr;
-	char buf[256];
-	int fd, cl, rc, pktRes, devicesFound = 0;
-	bool startFlag = false, isFirstRun = true;
-    pcap_if_t *alldevsp , *device;
-    pcap_t *handle;
+/*Sniffer thread*/
+void sniffPackets(char * iface)
+{
+	static bool isFirstRun = true;
+	bool userDeviceFound = false;
+	int devicesFound = 0;
+	pcap_if_t *alldevsp;
+	pcap_t *handle;
 	char errbuf[100] , devNames[100][100];
+        
+	//Pcap init
+	if(pcap_findalldevs( &alldevsp , errbuf))
+	{
+		syslog (LOG_CRIT, "Server: Unable to find any devices");
+		write(initPipe[1], "ERR_NODEVICES", sizeof("ERR_NODEVICES") + 1);
+		return;
+	}
+        
+	pthread_mutex_lock(&mu_deviceStats);
+	selDeviceIndex = 0;
+	pthread_mutex_unlock(&mu_deviceStats);
+
+	write(initPipe[1], "NOT_DEVINIT_SUCCESS", sizeof("NOT_DEVINIT_SUCCESS") + 1);
 	
-	daemonize();
+	for(pcap_if_t* device = alldevsp ; device != NULL ; device = device->next)
+	{
+		if(device->name != NULL)
+			strcpy(devNames[devicesFound] , device->name);
+		
+		if (strcmp(devNames[devicesFound], iface) == 0) {
+			
+			pthread_mutex_lock(&mu_deviceStats);
+			selDeviceIndex = devicesFound;
+			pthread_mutex_unlock(&mu_deviceStats);
+			write(initPipe[1], "NOT_USERDEV_FOUND", sizeof("NOT_USERDEV_FOUND") + 1);
+			userDeviceFound = true;
+		}
+		devicesFound++;
+	}
+	
+	if (!userDeviceFound)
+		write(initPipe[1], "NOT_USERDEV_NOTFOUND", sizeof("NOT_USERDEV_NOTFOUND") + 1);
+	
+	//Cleanup before reading from file
+	pthread_mutex_lock(&mu_deviceStats);	
+	if (!isFirstRun) {	
+		for (int i = 0; i < deviceCount; i++) {
+			avlCloseWithFunction(deviceStats[i].ipTree, freeNodeData);
+		}
+		free(deviceStats);
+	}
+	else
+		isFirstRun = false;
+		
+	deviceCount = devicesFound;
+	pthread_mutex_unlock(&mu_deviceStats);
+	
+	//Internal structure init	
+	if (readStats()) {
+		//Continue allocating but for new ifaces
+		int newDevices = devicesFound;
+		int *newDevicesMask = (int*) malloc(sizeof(int) * devicesFound);
+		
+		//Count how many *new* devices were found and set mask to filter out existing during init
+		for (int i = 0; i < devicesFound; i++) {
+			pthread_mutex_lock(&mu_deviceStats);
+			for (int j = 0; j < deviceCount; j++) {
+				if (strcmp(devNames[i], deviceStats[j].deviceName) == 0) {
+					newDevices--;
+					newDevicesMask[i] = 1;
+					break;
+				}
+				else
+					newDevicesMask[i] = 0;
+			}
+			pthread_mutex_unlock(&mu_deviceStats);
+		}
+		
+		pthread_mutex_lock(&mu_deviceStats);
+		deviceStats = (struct deviceStat_t*) realloc(deviceStats, sizeof(struct deviceStat_t) * (deviceCount + newDevices));	
+		
+		//Init new devices
+		for (int i = deviceCount; i < deviceCount + newDevices; i++) {
+			for (int j = 0; j < devicesFound; j++) {
+				if (newDevicesMask[j] == 0) {
+					newDevicesMask[j] = 1;
+					strcpy(deviceStats[i].deviceName, devNames[j]);
+				}
+			}
+			deviceStats[i].ipCount = 0;
+			deviceStats[i].ipTree = avlNewTree(cmp_ipStat, 0, sizeof(in_addr_t));
+		}
+		
+		deviceCount += newDevices;
+		pthread_mutex_unlock(&mu_deviceStats);
+		
+		free (newDevicesMask);
+	}
+	else {
+		pthread_mutex_lock(&mu_deviceStats);
+		deviceStats = (struct deviceStat_t*) malloc(sizeof(struct deviceStat_t) * deviceCount);
+		for (int i = 0; i < deviceCount; i++) {
+			strcpy(deviceStats[i].deviceName, devNames[i]);
+			deviceStats[i].ipCount = 0;                       
+			deviceStats[i].ipTree = avlNewTree(cmp_ipStat, 0, sizeof(in_addr_t)); 
+		}
+		pthread_mutex_unlock(&mu_deviceStats);		
+	}		
+	
+	//Open handle
+	handle = pcap_open_live(devNames[selDeviceIndex] , 65536 , 1 , 200 , errbuf);
+	if (handle == NULL) {
+		syslog (LOG_WARNING, "Server: Couldn't open device for sniffing");
+		write(initPipe[1], "ERR_HANDLE_FAIL", sizeof("ERR_HANDLE_FAIL") + 1);
+		return;
+	}
+	if (pcap_datalink(handle) != 1) {
+		syslog (LOG_WARNING, "Server: Incorrect datalink type");
+		write(initPipe[1], "ERR_INVDATALINK", sizeof("ERR_INVDATALINK") + 1);
+		return;            
+	}
+            	
+	//Signal command thread that everything's OK
+	write(initPipe[1], "NOT_HANDLE_SUCCESS", sizeof("NOT_HANDLE_SUCCESS") + 1);
+
+	pthread_mutex_lock(&mu_isSniffing);
+	sniffingFlag = true;
+	pthread_mutex_unlock(&mu_isSniffing);
+	
+	//Sniffer loop
+	while (isSniffing()) {
+		struct pcap_pkthdr *header;
+		const u_char *pkt_data;
+		
+		int pktRes = pcap_next_ex(handle, &header, &pkt_data);
+		
+		if(pktRes == 0) //Timed out
+			continue;
+		
+		struct ethhdr *eth = (struct ethhdr*) pkt_data;
+		if (eth->h_proto != htons(ETH_P_IP))
+			continue;
+                
+		struct iphdr *iph = (struct iphdr *)(pkt_data  + sizeof(struct ethhdr));
+ 
+		pthread_mutex_lock(&mu_deviceStats);
+		        
+		struct ipStat_t* foundNode = (struct ipStat_t*) avlFind(deviceStats[selDeviceIndex].ipTree, (DSKEY) iph->saddr);		
+		
+		if (foundNode)
+			foundNode->packetCount++;
+		else {
+			struct ipStat_t* ipEntry = calloc(1, sizeof(struct ipStat_t));
+			ipEntry->ip = iph->saddr;
+			ipEntry->packetCount = 1;
+                        
+			avlAdd(deviceStats[selDeviceIndex].ipTree, ipEntry->ip, (void*) ipEntry);
+			
+			deviceStats[selDeviceIndex].ipCount++;
+		}
+		pthread_mutex_unlock(&mu_deviceStats);
+	}
+	
+	pcap_close(handle);
+	writeStats();
+}
+
+/*Handle commands thread*/
+void processRequests()
+{
+	char *socket_path = "\0hidden";
+	struct sockaddr_un addr;
+	bool startFlag = false;
+	char buf[256], currentIface[32] = "eth0";
+	int fd, cl, rc;
+	pthread_t snifferThread;
+
+	//Pipe init
+	if (pipe(initPipe) < 0) {
+		syslog (LOG_ERR, "Server: Error creating pipe between threads");
+	} 
 	
 	//Sockets init
 	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
@@ -418,7 +598,8 @@ int main() {
 	if (*socket_path == '\0') {
 		*addr.sun_path = '\0';
 		strncpy(addr.sun_path + 1, socket_path + 1, sizeof(addr.sun_path) - 2);
-	} else {
+	} 
+	else {
 		strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
 		unlink(socket_path);
 	}
@@ -431,76 +612,14 @@ int main() {
 	if (listen(fd, 5) == -1) {
 		syslog (LOG_CRIT, "Server: Unable to listen port");
 		exit(-1);
-	}
+	}	
 	
-	//Pcap init
-    if(pcap_findalldevs( &alldevsp , errbuf) )
-    {
-        syslog (LOG_CRIT, "Server: Unable to find any devices");
-        exit(1);
-    }
-	
-    for(device = alldevsp ; device != NULL ; device = device->next)
-    {
-        if(device->name != NULL)
-            strcpy(devNames[devicesFound] , device->name);
-        devicesFound++;
-		if (strcmp(devNames[devicesFound], "eth0") == 0)
-			selDeviceIndex = devicesFound;
-    }
-	
-	deviceCount = devicesFound;
-	
-	//Internal structure init	
-	if (readStats()) {
-		//Continue allocating but for new ifaces
-		int newDevices = devicesFound;
-		int *newDevicesMask = (int*) malloc(sizeof(int) * devicesFound);
-		
-		//Count how many *new* devices were found and set mask to filter out existing during init
-		for (int i = 0; i < devicesFound; i++) {
-			for (int j = 0; j < deviceCount; j++) {
-				if (strcmp(devNames[i], deviceStats[j].deviceName) == 0) {
-					newDevices--;
-					newDevicesMask[i] = 1;
-					break;
-				}
-				else
-					newDevicesMask[i] = 0;
-			}
-		}
-
-		deviceStats = (struct deviceStat_t*) realloc(deviceStats, sizeof(struct deviceStat_t) * (deviceCount + newDevices));	
-		
-		//Init new devices
-		for (int i = deviceCount; i < deviceCount + newDevices; i++) {
-			for (int j = 0; j < devicesFound; j++) {
-				if (newDevicesMask[j] == 0) {
-					newDevicesMask[j] = 1;
-					strcpy(deviceStats[i].deviceName, devNames[j]);
-				}
-			}
-			deviceStats[i].ipStats = (struct ipStat_t*) malloc(sizeof(struct ipStat_t) * 100);
-                        deviceStats[i].ipCount = 0;
-		}		
-		
-		deviceCount += newDevices;
-		free (newDevicesMask);
-	}
-	else {
-		deviceStats = (struct deviceStat_t*) malloc(sizeof(struct deviceStat_t) * deviceCount);
-		for (int i = 0; i < deviceCount; i++) {
-			strcpy(deviceStats[i].deviceName, devNames[i]);
-			deviceStats[i].ipStats = (struct ipStat_t*) malloc(sizeof(struct ipStat_t) * 100);
-                        deviceStats[i].ipCount = 0;
-		}		
-	}
-	//Main Loop
-	while (true) {
-            buf[0] = 0;
+	while (!isShutdown()) {
+		buf[0] = 0;
 		if ((cl = accept(fd, NULL, NULL)) != -1) { //Handle commands
+			
 			rc = read(cl, buf, sizeof(buf));
-			//Assume data sent is in valid format
+			
 			if (rc > 0) {
 				char * tokP = strtok(buf, ";");
 				switch (atoi(tokP))
@@ -511,32 +630,52 @@ int main() {
 								syslog (LOG_WARNING, "Server: Partial write to socket");
 							syslog (LOG_WARNING, "Server: Request - Sniffer already started");							
 						}
-						else {
-							if (!isFirstRun) {
-								for (int i = 0; i < deviceCount; i++)
-									free(deviceStats[i].ipStats);
-								free(deviceStats);
-								readStats();								
-							}
-							else
-								isFirstRun = false;
-
-							handle = pcap_open_live(devNames[selDeviceIndex] , 65536 , 1 , 200 , errbuf);
-							
-							if (handle == NULL) {
-								startFlag = false;
-                                                                setSocketBlockingEnabled(fd, true);
-								if (!writeWrap(cl, "Couldn't start sniffer: unable to open device\n", sizeof("Couldn't start sniffer: unable to open device\n")))
-									syslog (LOG_WARNING, "Server: Partial write to socket");							
-								syslog (LOG_WARNING, "Server: Couldn't open device for sniffing");								
+						else {	
+							//Start sniffer thread
+							char pipeBuf[32];
+                                                
+							pthread_create(&snifferThread, NULL, (void*) &sniffPackets, &currentIface);
+                                                        
+							read(initPipe[0], pipeBuf, sizeof(pipeBuf));
+                                                        
+							if (strcmp(pipeBuf, "NOT_DEVINIT_SUCCESS") == 0) {
+                                                            
+								read(initPipe[0], pipeBuf, sizeof(pipeBuf)); //Skip device list init signal
+								read(initPipe[0], pipeBuf, sizeof(pipeBuf)); //Listen for handle init
+								
+								if (strcmp(pipeBuf, "ERR_HANDLE_FAIL") == 0) {	
+									startFlag = false;								
+									pthread_join(snifferThread, NULL);
+									
+									if (!writeWrap(cl, "Couldn't start sniffer: unable to open device\n", sizeof("Couldn't start sniffer: unable to open device\n")))
+										syslog (LOG_WARNING, "Server: Partial write to socket");							
+									syslog (LOG_WARNING, "Server: Couldn't open device for sniffing");								
+								}
+								else if (strcmp(pipeBuf, "ERR_INVDATALINK") == 0) {
+									startFlag = false;								
+									pthread_join(snifferThread, NULL);
+									
+									if (!writeWrap(cl, "Couldn't start sniffer: non-ethernet device selected\n", sizeof("Couldn't start sniffer: non-ethernet device selected\n")))
+										syslog (LOG_WARNING, "Server: Partial write to socket");							
+									syslog (LOG_WARNING, "Server: Incorrect device datalink type, aborting sniffing");                                                                    
+                                                                }
+								else {
+									startFlag = true;
+									
+									if (!writeWrap(cl, "Sniffer started!\n", sizeof("Sniffer started!\n")))
+										syslog (LOG_WARNING, "Server: Partial write to socket");							
+									syslog (LOG_NOTICE, "Server: Sniffer started by user request");
+								}								
 							}
 							else {
-                                                                setSocketBlockingEnabled(fd, false);
-                                                                startFlag = true;								
-                                                                if (!writeWrap(cl, "Sniffer started!\n", sizeof("Sniffer started!\n")))
+								startFlag = false;								
+								pthread_join(snifferThread, NULL);
+								
+								if (!writeWrap(cl, "Couldn't start sniffer: no devices found\n", sizeof("Couldn't start sniffer: no devices found\n")))
 									syslog (LOG_WARNING, "Server: Partial write to socket");							
-								syslog (LOG_NOTICE, "Server: Sniffer started by user request");
+								syslog (LOG_WARNING, "Server: No devices found for sniffing");									
 							}
+							
 						}
 						break;
 					case 1:
@@ -546,13 +685,13 @@ int main() {
 							syslog (LOG_WARNING, "Server: Request - Sniffer already stopped");							
 						}
 						else {
-                                                        setSocketBlockingEnabled(fd, true);	
-                                                        startFlag = false;
-							pcap_close(handle);
+							startFlag = false;
 							
-							writeStats();
-							selDeviceIndex = 0;
-							deviceCount = 0;
+							pthread_mutex_lock(&mu_isSniffing);
+							sniffingFlag = false;
+							pthread_mutex_unlock(&mu_isSniffing);
+							
+							pthread_join(snifferThread, NULL);
 							
 							if (!writeWrap(cl, "Sniffer stopped!\n", sizeof("Sniffer stopped!\n")))
 								syslog (LOG_WARNING, "Server: Partial write to socket");							
@@ -562,57 +701,99 @@ int main() {
 					case 2:
 						tokP = strtok(NULL, ";");
 						if (tokP != NULL) {
-                                                    int ifaceIndex = -1;
-                                                    for (int i = 0; i < deviceCount; i++)
-                                                        if (strcmp(deviceStats[i].deviceName, tokP) == 0)
-                                                            ifaceIndex = i;
-                                                    sendStatsOnIface(cl, ifaceIndex);
-                                                }	
+							int ifaceIndex = -1;
+							
+							pthread_mutex_lock(&mu_deviceStats);
+							for (int i = 0; i < deviceCount; i++)
+								if (strcmp(deviceStats[i].deviceName, tokP) == 0)
+									ifaceIndex = i;
+							pthread_mutex_unlock(&mu_deviceStats);
+							
+							sendStatsOnIface(cl, ifaceIndex);
+						}	
 						else
 							sendStats(cl);
 						syslog (LOG_NOTICE, "Server: Query - sent interface stats to client");
 						break;
 					case 3:
-						tokP = strtok(NULL, ";");
+						tokP = strtok(NULL, ";");						
 						sendIpStats(tokP, cl);
 						syslog (LOG_NOTICE, "Server: Query - sent IP stats to client");
 						break;
 					case 4:
 						tokP = strtok(NULL, ";");
 						char * iface = tokP;
-                                                int ifaceIndex = -1;
+						strcpy(currentIface, iface);
 						
-						for (int i = 0; i < deviceCount; i++) {
-							if (strcmp(devNames[i], iface) == 0)
-								ifaceIndex = i;
-						}
-                                                
-                                                if (ifaceIndex != -1) {
-                                                    if (startFlag)
-                                                        pcap_close(handle);
+						//Restart thread with new interface if is running
+						if (startFlag) {
+							bool ifaceFound = true;
+							char pipeBuf[32];
 							
-                                                    handle = pcap_open_live(devNames[ifaceIndex] , 65536 , 1 , 200 , errbuf);
+							pthread_mutex_lock(&mu_isSniffing);
+							sniffingFlag = false;
+							pthread_mutex_unlock(&mu_isSniffing);
+							
+							pthread_join(snifferThread, NULL);
+                                                                                                         							
+							pthread_create(&snifferThread, NULL, (void*) &sniffPackets, &currentIface);
+                                                        
+							read(initPipe[0], pipeBuf, sizeof(pipeBuf));
+ 							
+							if (strcmp(pipeBuf, "NOT_DEVINIT_SUCCESS") == 0) {
+								read(initPipe[0], pipeBuf, sizeof(pipeBuf));   
+								//Sniffer thread passed device init
+								if (strcmp(pipeBuf, "NOT_USERDEV_FOUND") == 0)
+									ifaceFound = false;
+								
+								read(initPipe[0], pipeBuf, sizeof(pipeBuf));  
+								//Sniffer thread passed handle init
+								if (strcmp(pipeBuf, "ERR_HANDLE_FAIL") == 0) {	
+									//Handle didn't init properly
+									startFlag = false;									
+									pthread_join(snifferThread, NULL);
+									
+									if (!writeWrap(cl, "Couldn't start sniffer: unable to open device\n", sizeof("Couldn't start sniffer: unable to open device\n")))
+										syslog (LOG_WARNING, "Server: Partial write to socket");							
+									syslog (LOG_WARNING, "Server: Couldn't open device for sniffing");
+								}
+								else if (strcmp(pipeBuf, "ERR_INVDATALINK") == 0) {
+									startFlag = false;								
+									pthread_join(snifferThread, NULL);
+									
+									if (!writeWrap(cl, "Couldn't start sniffer: non-ethernet device selected\n", sizeof("Couldn't start sniffer: non-ethernet device selected\n")))
+										syslog (LOG_WARNING, "Server: Partial write to socket");							
+									syslog (LOG_WARNING, "Server: Incorrect device datalink type, aborting sniffing");                                                                       
+                                }
+								else {
+									if (ifaceFound) {
+										if (!writeWrap(cl, "Interface set for sniffing\n", sizeof("Interface set for sniffing\n")))
+											syslog (LOG_WARNING, "Server: Partial write to socket");
+										syslog (LOG_NOTICE, "Server: Selected new interface by user request");
+									}									
+									else {
+										if (!writeWrap(cl, "Interface not found! Resuming sniffing on default interface\n", sizeof("Interface not found! Resuming sniffing on default interface\n")))
+											syslog (LOG_WARNING, "Server: Partial write to socket");
+										syslog (LOG_NOTICE, "Server: Requested interface not found, selected default");
+									} 									
+								}								
+							}
+							else {
+								//No devices found
+								startFlag = false;								
+								pthread_join(snifferThread, NULL);
+								
+								if (!writeWrap(cl, "Couldn't start sniffer: no devices found\n", sizeof("Couldn't start sniffer: no devices found\n")))
+									syslog (LOG_WARNING, "Server: Partial write to socket");							
+								syslog (LOG_WARNING, "Server: No devices found for sniffing");										
+							}
+						}
+						else {
+							if (!writeWrap(cl, "Interface set for sniffing\n", sizeof("Interface set for sniffing\n")))
+									syslog (LOG_WARNING, "Server: Partial write to socket");
+							syslog (LOG_NOTICE, "Server: Selected new interface by user request");                                    
+						}
 
-                                                    if (handle == NULL) {
-                                                            startFlag = false;
-                                                            setSocketBlockingEnabled(fd, true);
-                                                            if (!writeWrap(cl, "Couldn't change interface: unable to open device\n", sizeof("Couldn't change interface: unable to open device\n")))
-                                                                    syslog (LOG_WARNING, "Server: Partial write to socket");							
-                                                            syslog (LOG_WARNING, "Server: Couldn't open new device for sniffing");								
-                                                    }
-                                                    else {
-                                                            setSocketBlockingEnabled(fd, false);
-                                                            startFlag = true;
-                                                            selDeviceIndex = ifaceIndex;
-                                                            if (!writeWrap(cl, "Interface set for sniffing\n", sizeof("Interface set for sniffing\n")))
-                                                                    syslog (LOG_WARNING, "Server: Partial write to socket");							
-                                                            syslog (LOG_NOTICE, "Server: Selected new interface by user request");
-                                                    }                                                    
-                                                }
-                                                else
-                                                    if (!writeWrap(cl, "Interface not found\n", sizeof("Interface not found\n")))
-                                                           syslog (LOG_WARNING, "Server: Partial write to socket");                                                   
-						
 						syslog (LOG_NOTICE, "Server: Selected new interface for sniffer");
 						break;
 					default:
@@ -625,56 +806,21 @@ int main() {
 				syslog (LOG_NOTICE, "Server: Received empty request, ignoring");
 			close(cl);
 		}
-		if (startFlag) {	//Sniff single packet
-			struct pcap_pkthdr *header;
-			const u_char *pkt_data;
-			int index = 0;
-                        bool isReadable = false;
-			
-			pktRes = pcap_next_ex(handle, &header, &pkt_data);
-			
-			if(pktRes == 0) //Timed out
-				continue;
-			
-			struct iphdr *iph = (struct iphdr *)(pkt_data  + sizeof(struct ethhdr));
-                        
-                        switch (iph->protocol) 
-                        {
-                            case 1:  //ICMP Protocol
-                            case 6:  //TCP Protocol
-                            case 17: //UDP Protocol
-                                isReadable = true;
-                                break;
-                            default: //Other protocols
-                                break;
-                        }                        
-                        
-                        if (!isReadable)
-                            continue;
-                        
-			index = bsearch_ip(iph->saddr);
-			if (index != -1)
-				deviceStats[selDeviceIndex].ipStats[index].packetCount++;
-			else {
-				//Realloc for additional 100 IPs if page is exceeded
-				if ((deviceStats[selDeviceIndex].ipCount % 100) == 0 && deviceStats[selDeviceIndex].ipCount != 0) {
-					deviceStats[selDeviceIndex].ipStats = (struct ipStat_t*) 
-						realloc(deviceStats[selDeviceIndex].ipStats, (sizeof(struct ipStat_t) * (deviceStats[selDeviceIndex].ipCount / 100 + 1)));					
-				}
-				deviceStats[selDeviceIndex].ipStats[deviceStats[selDeviceIndex].ipCount].ip = iph->saddr;
-				deviceStats[selDeviceIndex].ipStats[deviceStats[selDeviceIndex].ipCount].packetCount = 1;
-                                deviceStats[selDeviceIndex].ipCount++;
-				
-				/*Reason for sorting here, of all places, is because task requires IP lookup to have complexity of O(log(n))
-				  Lookup itself is based on binary search, hence O(log(n)) complexity, but it requires array to be sorted beforehand
-				  This leaves us with two options - sort every N packets and risk missing the lookup call or sort on every insert*/
-				msort_ip(deviceStats[selDeviceIndex].ipStats, 0, deviceStats[selDeviceIndex].ipCount - 1);
-			}
-		}
-		sleep(1);
 	}
-	
-	daemonShutdown();
-	
-	return 0;
+	//Thread termination routines
+	close (fd);
+	if (startFlag) {
+		
+		pthread_mutex_lock(&mu_isSniffing);
+		sniffingFlag = false;
+		pthread_mutex_unlock(&mu_isSniffing);
+		
+		pthread_join(snifferThread, NULL);		
+	}
+}
+
+int main() {          
+	daemonize();
+	pthread_create(&handleRequestsThread, NULL, (void*) &processRequests, NULL);
+	pthread_exit(0);
 }

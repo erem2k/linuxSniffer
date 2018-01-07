@@ -1,6 +1,6 @@
 CC=gcc
 CFLAGS=-std=gnu99
-LDFLAGS = -lpcap
+LDFLAGS = -lpcap -lpthread -lds
 
 all: sniffer_daemon sniffer_client
  
@@ -8,7 +8,7 @@ sniffer_daemon: sniffer_daemon.o
 	$(CC) sniffer_daemon.o -o sniffer_daemon $(LDFLAGS)
 	rm -f sniffer_daemon.o
 sniffer_client: sniffer_client.o
-	$(CC) sniffer_client.o -o sniffer_client $(LDFLAGS)
+	$(CC) sniffer_client.o -o sniffer_client
 	rm -f sniffer_client.o
 .PHONY: clean
 clean:

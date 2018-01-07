@@ -111,21 +111,21 @@ int main(int argc, char *argv[]) {
 			break;
 		case 4:
 			if (strcmp(argv[1], "show") == 0 && strcmp(argv[3], "count") == 0) {
-                                in_addr_t ipValidator = inet_addr(argv[2]);
-                                
-                                if (ipValidator != -1) {
-                                    char cmdindex[] = ";3;";
-                                    char* cmd = calloc(strlen(cmdindex) + strlen(argv[2]), sizeof(char));	
-                                    strcpy(cmd, cmdindex);
-                                    strcat(cmd, argv[2]);
+				in_addr_t ipValidator = inet_addr(argv[2]);
 				
-                                    if (!writeWrap(fd, cmd, strlen(cmd) + 1))
-                                        fprintf(stderr, "Client: Partial write to socket");
-                                    outputFlag = true;
-                                    free (cmd);
-                                }
-                                else
-                                    printf("Incorrect IP format!\n");
+				if (ipValidator != -1) {
+					char cmdindex[] = ";3;";
+					char* cmd = calloc(strlen(cmdindex) + strlen(argv[2]), sizeof(char));	
+					strcpy(cmd, cmdindex);
+					strcat(cmd, argv[2]);
+
+					if (!writeWrap(fd, cmd, strlen(cmd) + 1))
+						fprintf(stderr, "Client: Partial write to socket");
+					outputFlag = true;
+					free (cmd);
+				}
+				else
+					printf("Incorrect IP format!\n");
 				break;
 			}			
 			if (strcmp(argv[1], "select") == 0 && strcmp(argv[2], "iface") == 0) {
@@ -154,6 +154,8 @@ int main(int argc, char *argv[]) {
 		while(read(fd, buf, sizeof(buf)) > 0)
                     printf("%s", buf);
 	}
+	
+	close(fd);
 
 	return 0;
 }
